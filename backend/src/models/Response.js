@@ -16,6 +16,10 @@ const responseSchema = new mongoose.Schema({
     ref: 'User',
     required: true
   },
+  submissionId: {
+    type: String,
+    trim: true
+  },
   selectedOption: {
     type: Number,
     required: true
@@ -44,6 +48,7 @@ const responseSchema = new mongoose.Schema({
 
 // Index for fast lookups
 responseSchema.index({ roomId: 1, questionId: 1, studentId: 1 }, { unique: true })
+responseSchema.index({ submissionId: 1 }, { unique: true, sparse: true })
 // Index for leaderboard queries
 responseSchema.index({ roomId: 1, studentId: 1, points: -1 })
 

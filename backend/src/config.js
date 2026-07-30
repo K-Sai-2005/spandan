@@ -9,6 +9,8 @@ export const config = {
   openaiApiKey: process.env.OPENAI_API_KEY || '',
   anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
   googleApiKey: process.env.GOOGLE_API_KEY || '',
+  redisUrl: process.env.REDIS_URL || '',
+  submissionIdempotencyTtlSeconds: parseInt(process.env.SUBMISSION_IDEMPOTENCY_TTL_SECONDS || '86400', 10),
   nodeEnv: process.env.NODE_ENV || 'development'
 }
 

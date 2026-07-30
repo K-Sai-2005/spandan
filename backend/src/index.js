@@ -259,12 +259,27 @@ io.on('connection', (socket) => {
   })
 
   // Question events
-  socket.on('question:start', (data) => {
+  socket.on('question:start', async (data) => {
+    const publishTime = new Date()
+    const timeToAnswer = data.timer || data.question?.timeToAnswer || 30
+    const expiresAt = new Date(publishTime.getTime() + timeToAnswer * 1000)
+
+    try {
+      const Question = (await import('./models/Question.js')).default
+      if (data.questionId) {
+        await Question.findByIdAndUpdate(data.questionId, { publishTime, expiresAt })
+      }
+    } catch (error) {
+      console.error('Error recording question publish time:', error)
+    }
+
     io.to(data.roomCode).emit('question:started', {
       questionId: data.questionId,
       question: data.question,
-      timer: data.timer,
-      startTime: Date.now()
+      timer: timeToAnswer,
+      publishTime: publishTime.toISOString(),
+      expiresAt: expiresAt.toISOString(),
+      startTime: publishTime.getTime()
     })
   })
 
@@ -276,12 +291,30 @@ io.on('connection', (socket) => {
   })
 
   // New question from teacher (manually created)
-  socket.on('new_question', (data) => {
+  socket.on('new_question', async (data) => {
     console.log('New question received from teacher:', data.question?.question?.substring(0, 50))
     const roomCode = data.roomCode
     const question = data.question
     if (roomCode && question) {
-      io.to(roomCode).emit('new_question', question)
+      const publishTime = new Date()
+      const timeToAnswer = question.timeToAnswer || 30
+      const expiresAt = new Date(publishTime.getTime() + timeToAnswer * 1000)
+      const launchedQuestion = {
+        ...question,
+        publishTime: publishTime.toISOString(),
+        expiresAt: expiresAt.toISOString()
+      }
+
+      try {
+        const Question = (await import('./models/Question.js')).default
+        if (question._id) {
+          await Question.findByIdAndUpdate(question._id, { publishTime, expiresAt })
+        }
+      } catch (error) {
+        console.error('Error recording new question publish time:', error)
+      }
+
+      io.to(roomCode).emit('new_question', launchedQuestion)
     } else {
       console.error('new_question event missing roomCode or question:', data)
     }

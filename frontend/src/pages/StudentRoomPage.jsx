@@ -8,6 +8,97 @@ import ThemeToggle from '../components/ThemeToggle'
 import ProfileDropdown from '../components/ProfileDropdown'
 import Leaderboard from '../components/Leaderboard'
 import { API_URL } from '../config.js'
+import submissionQueueService from '../services/submissionQueueService.js'
+import {
+  createSubmissionRetryWorker,
+  bindSubmissionRetryTriggers,
+  SubmissionRetryError
+} from '../services/submissionRetryWorker.js'
+
+const SUBMISSION_UI_STATUS = Object.freeze({
+  SAVED_LOCALLY: 'saved_locally',
+  SYNCING: 'syncing',
+  SUBMITTED: 'submitted',
+  FAILED: 'failed'
+})
+
+const SUBMISSION_STATUS_VIEW = Object.freeze({
+  [SUBMISSION_UI_STATUS.SAVED_LOCALLY]: {
+    label: 'Saved locally',
+    description: 'Your answer is queued and will sync automatically.',
+    background: 'rgba(254, 243, 199, 0.22)',
+    border: 'rgba(251, 191, 36, 0.55)',
+    color: '#fef3c7'
+  },
+  [SUBMISSION_UI_STATUS.SYNCING]: {
+    label: 'Syncing',
+    description: 'Submitting your answer to the server...',
+    background: 'rgba(219, 234, 254, 0.2)',
+    border: 'rgba(147, 197, 253, 0.55)',
+    color: '#dbeafe'
+  },
+  [SUBMISSION_UI_STATUS.SUBMITTED]: {
+    label: 'Submitted',
+    description: 'Your answer has been received.',
+    background: 'rgba(209, 250, 229, 0.22)',
+    border: 'rgba(52, 211, 153, 0.55)',
+    color: '#d1fae5'
+  },
+  [SUBMISSION_UI_STATUS.FAILED]: {
+    label: 'Failed',
+    description: 'This answer could not be submitted.',
+    background: 'rgba(254, 226, 226, 0.22)',
+    border: 'rgba(248, 113, 113, 0.65)',
+    color: '#fee2e2'
+  }
+})
+
+async function submitQueuedResponse(submission, token) {
+  let response
+
+  try {
+    response = await fetch(`${API_URL}/responses`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`
+      },
+      body: JSON.stringify({
+        submissionId: submission.submissionId,
+        roomId: submission.roomId,
+        questionId: submission.questionId,
+        studentId: submission.studentId,
+        selectedOptions: submission.selectedAnswer,
+        responseTime: submission.responseTime,
+        clientSubmittedAt: submission.clientSubmittedAt
+      })
+    })
+  } catch (error) {
+    throw new SubmissionRetryError(error.message || 'Network request failed', {
+      retryable: true
+    })
+  }
+
+  const data = await response.json().catch(() => ({}))
+
+  if (!response.ok) {
+    throw new SubmissionRetryError(data.error || `Response submission failed with status ${response.status}`, {
+      retryable: response.status >= 500,
+      status: response.status,
+      response: data
+    })
+  }
+
+  if (!data.success) {
+    throw new SubmissionRetryError(data.error || 'Response submission was rejected', {
+      retryable: false,
+      status: response.status,
+      response: data
+    })
+  }
+
+  return data
+}
 
 function StudentRoomPage() {
   const { roomCode } = useParams()
@@ -22,12 +113,14 @@ function StudentRoomPage() {
   const [currentQuestion, setCurrentQuestion] = useState(null)
   const [selectedOptions, setSelectedOptions] = useState([]) // Array for MSQ support
   const [submitted, setSubmitted] = useState(false)
+  const [submissionUiStatus, setSubmissionUiStatus] = useState(null)
   const [hasAnsweredPoll, setHasAnsweredPoll] = useState(false) // Track if student has answered at least one poll
   const [timeLeft, setTimeLeft] = useState(0)
   const [results, setResults] = useState(null)
   // Past responses loaded from MongoDB - no sessionStorage needed
   const [pastResponses, setPastResponses] = useState([])
   const timerIntervalRef = useRef(null)
+  const retryWorkerRef = useRef(null)
 
   useEffect(() => {
     if (!token || !socket) return
@@ -40,6 +133,55 @@ function StudentRoomPage() {
     }
   }, [token, socket])
 
+  useEffect(() => {
+    if (!token || !room?._id) return
+
+    const retryWorker = createSubmissionRetryWorker({
+      queue: submissionQueueService,
+      submit: (submission) => submitQueuedResponse(submission, token),
+      onSynced: (submission, saveData) => {
+        setSubmissionUiStatus(SUBMISSION_UI_STATUS.SUBMITTED)
+
+        if (socket && room?.code && saveData?.response) {
+          socket.emit('points:update', {
+            roomCode: room.code,
+            questionId: submission.questionId,
+            studentId: submission.studentId,
+            points: saveData.response.points,
+            isCorrect: saveData.response.isCorrect
+          })
+        }
+
+        if (room?._id && user?._id) {
+          fetchPastResponses(room._id, user._id)
+        }
+      },
+      onFailed: (submission, error) => {
+        setSubmissionUiStatus(SUBMISSION_UI_STATUS.FAILED)
+        console.error('[StudentRoom] Queued response will not be retried:', {
+          submissionId: submission?.submissionId,
+          status: error?.status,
+          message: error?.message
+        })
+      }
+    })
+
+    retryWorkerRef.current = retryWorker
+    retryWorker.schedule()
+    const unsubscribeReconnectTriggers = bindSubmissionRetryTriggers({
+      worker: retryWorker,
+      socket
+    })
+
+    return () => {
+      unsubscribeReconnectTriggers()
+      retryWorker.stop()
+      if (retryWorkerRef.current === retryWorker) {
+        retryWorkerRef.current = null
+      }
+    }
+  }, [token, room?._id, room?.code, socket, user?._id])
+
 
 
   useEffect(() => {
@@ -49,6 +191,7 @@ function StudentRoomPage() {
       setCurrentQuestion(data)
       setSelectedOptions([])
       setSubmitted(false)
+      setSubmissionUiStatus(null)
       setTimeLeft(data.timer || 30)
       
       if (data.question && data.question.timeToAnswer) {
@@ -104,6 +247,7 @@ function StudentRoomPage() {
       setCurrentQuestion(question)
       setSelectedOptions([])
       setSubmitted(false)
+      setSubmissionUiStatus(null)
       setTimeLeft(question.timeToAnswer || 30)
       
       timerIntervalRef.current = setInterval(() => {
@@ -208,6 +352,15 @@ function StudentRoomPage() {
     const questionId = currentQuestion._id || currentQuestion.question?._id
     const tta = currentQuestion.timeToAnswer || 30
     const responseTime = tta - timeLeft
+    const queuedSubmission = submissionQueueService.enqueue({
+      roomId: room._id,
+      questionId,
+      studentId: user._id,
+      selectedAnswer: selectedOptions,
+      responseTime,
+      clientSubmittedAt: new Date().toISOString()
+    })
+    setSubmissionUiStatus(SUBMISSION_UI_STATUS.SAVED_LOCALLY)
     
     console.log('[StudentRoom] Submitting answer:', { 
       questionId, 
@@ -221,25 +374,14 @@ function StudentRoomPage() {
 
     // Save to MongoDB - wait for it to complete before fetching past responses
     try {
-      const saveResponse = await fetch(`${API_URL}/responses`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
-        },
-        body: JSON.stringify({
-          roomId: room._id,
-          questionId,
-          studentId: user._id,
-          selectedOptions,
-          responseTime
-        })
-      })
-      const saveData = await saveResponse.json()
+      setSubmissionUiStatus(SUBMISSION_UI_STATUS.SYNCING)
+      const saveData = await submitQueuedResponse(queuedSubmission, token)
       console.log('[StudentRoom] Response saved:', saveData)
       
       // Emit points:update for leaderboard broadcast
       if (saveData.success && saveData.response) {
+        setSubmissionUiStatus(SUBMISSION_UI_STATUS.SUBMITTED)
+        submissionQueueService.markSynced(queuedSubmission.submissionId)
         socket.emit('points:update', {
           roomCode: room.code,
           questionId,
@@ -250,6 +392,13 @@ function StudentRoomPage() {
       }
     } catch (err) {
       console.error('Failed to save response:', err)
+      if (!err?.retryable) {
+        submissionQueueService.markFailed(queuedSubmission.submissionId)
+        setSubmissionUiStatus(SUBMISSION_UI_STATUS.FAILED)
+      } else {
+        setSubmissionUiStatus(SUBMISSION_UI_STATUS.SAVED_LOCALLY)
+        retryWorkerRef.current?.schedule()
+      }
     }
 
     // Emit via socket
@@ -275,6 +424,30 @@ function StudentRoomPage() {
     }
     navigate('/student')
   }
+
+  const submissionStatusView = SUBMISSION_STATUS_VIEW[submissionUiStatus]
+  const submissionStatusBanner = submissionStatusView ? (
+    <div style={{
+      marginTop: '12px',
+      padding: '12px 14px',
+      background: submissionStatusView.background,
+      border: `1px solid ${submissionStatusView.border}`,
+      borderRadius: '10px',
+      color: submissionStatusView.color,
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: '12px',
+      flexWrap: 'wrap'
+    }}>
+      <span style={{ fontSize: '14px', fontWeight: '700' }}>
+        {submissionStatusView.label}
+      </span>
+      <span style={{ fontSize: '13px', opacity: 0.92 }}>
+        {submissionStatusView.description}
+      </span>
+    </div>
+  ) : null
 
   if (isLoading) {
     return (
@@ -538,29 +711,33 @@ function StudentRoomPage() {
                   background: 'rgba(255,255,255,0.1)',
                   borderRadius: '12px'
                 }}>
-                  <p style={{ fontSize: '18px', fontWeight: '600' }}>✓ Answer Submitted</p>
+                  <p style={{ fontSize: '18px', fontWeight: '600' }}>Answer Submitted</p>
                   <p style={{ fontSize: '14px', opacity: 0.9, marginTop: '8px' }}>
                     Waiting for next question...
                   </p>
+                  {submissionStatusBanner}
                 </div>
               ) : (
-                <button
-                  onClick={handleSubmitAnswer}
-                  disabled={selectedOptions.length === 0}
-                  style={{
-                    width: '100%',
-                    padding: '16px',
-                    background: selectedOptions.length > 0 ? '#ffd700' : 'rgba(255,255,255,0.2)',
-                    color: selectedOptions.length > 0 ? '#1f2937' : 'rgba(255,255,255,0.5)',
-                    border: 'none',
-                    borderRadius: '12px',
-                    fontSize: '16px',
-                    fontWeight: '600',
-                    cursor: selectedOptions.length > 0 ? 'pointer' : 'not-allowed'
-                  }}
-                >
-                  Submit Answer
-                </button>
+                <>
+                  <button
+                    onClick={handleSubmitAnswer}
+                    disabled={selectedOptions.length === 0}
+                    style={{
+                      width: '100%',
+                      padding: '16px',
+                      background: selectedOptions.length > 0 ? '#ffd700' : 'rgba(255,255,255,0.2)',
+                      color: selectedOptions.length > 0 ? '#1f2937' : 'rgba(255,255,255,0.5)',
+                      border: 'none',
+                      borderRadius: '12px',
+                      fontSize: '16px',
+                      fontWeight: '600',
+                      cursor: selectedOptions.length > 0 ? 'pointer' : 'not-allowed'
+                    }}
+                  >
+                    Submit Answer
+                  </button>
+                  {submissionStatusBanner}
+                </>
               )}
             </div>
           ) : (

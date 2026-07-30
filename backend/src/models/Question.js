@@ -36,6 +36,12 @@ const questionSchema = new mongoose.Schema({
     type: Number,
     default: 30
   },
+  publishTime: {
+    type: Date
+  },
+  expiresAt: {
+    type: Date
+  },
   points: {
     type: Number,
     default: 10

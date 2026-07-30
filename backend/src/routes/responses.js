@@ -1,6 +1,23 @@
 import express from 'express'
 import { authenticate, authorize } from '../middleware/auth.js'
+import {
+  createAcknowledgementPayload,
+  getProcessedSubmission,
+  sanitizeSubmissionId,
+  storeProcessedSubmission
+} from '../services/submissionIdempotencyService.js'
+import { validateResponseTiming } from '../services/responseTimingValidationService.js'
 const router = express.Router()
+
+function idsMatch(left, right) {
+  return left?.toString?.() === right?.toString?.()
+}
+
+function responseMatchesSubmissionContext(response, { roomId, questionId, studentId }) {
+  return idsMatch(response?.roomId, roomId) &&
+    idsMatch(response?.questionId, questionId) &&
+    idsMatch(response?.studentId, studentId)
+}
 
 // Apply authentication to all routes
 router.use(authenticate)
@@ -13,7 +30,9 @@ router.post('/', authorize('student'), async (req, res) => {
     const Question = (await import('../models/Question.js')).default
     const RoomMember = (await import('../models/RoomMember.js')).default
     
-    const { roomId, questionId, selectedOptions, responseTime } = req.body
+    const { roomId, questionId, selectedOptions, clientSubmittedAt } = req.body
+    const responseTime = Number(req.body.responseTime)
+    const submissionId = sanitizeSubmissionId(req.body.submissionId)
     const studentId = req.user._id // Must be authenticated user
 
     // Verify student is in the room (member of RoomMember)
@@ -26,10 +45,43 @@ router.post('/', authorize('student'), async (req, res) => {
       return res.status(400).json({ error: 'Missing required fields: roomId, questionId, and selectedOptions (array)' })
     }
 
+    if (submissionId) {
+      const processedSubmission = await getProcessedSubmission(submissionId)
+      if (processedSubmission?.success && responseMatchesSubmissionContext(processedSubmission.response, { roomId, questionId, studentId })) {
+        return res.status(200).json(processedSubmission)
+      }
+
+      const existingSubmissionResponse = await Response.findOne({ submissionId })
+      if (existingSubmissionResponse && responseMatchesSubmissionContext(existingSubmissionResponse, { roomId, questionId, studentId })) {
+        const payload = createAcknowledgementPayload(existingSubmissionResponse.toObject())
+        await storeProcessedSubmission(submissionId, payload)
+        return res.status(200).json(payload)
+      } else if (existingSubmissionResponse) {
+        return res.status(409).json({
+          success: false,
+          error: 'Submission ID has already been used for a different response'
+        })
+      }
+    }
+
     // Get the question to check correct answer and points
     const question = await Question.findById(questionId)
     if (!question) {
       return res.status(404).json({ error: 'Question not found' })
+    }
+
+    const timingValidation = validateResponseTiming({
+      question,
+      responseTime,
+      clientSubmittedAt,
+      receivedAt: new Date()
+    })
+
+    if (!timingValidation.valid) {
+      return res.status(timingValidation.status).json({
+        success: false,
+        error: timingValidation.error
+      })
     }
 
     // Check if answer is correct based on question type
@@ -60,7 +112,7 @@ router.post('/', authorize('student'), async (req, res) => {
     // Minimum 10% of max points for correct answers (even if time runs out)
     const maxPoints = question.points || 100
     const tta = question.timeToAnswer || 30
-    const respTime = responseTime || 0
+    const respTime = responseTime
     let points = 0
     
     if (isCorrect) {
@@ -74,6 +126,7 @@ router.post('/', authorize('student'), async (req, res) => {
       roomId,
       questionId,
       studentId,
+      ...(submissionId && { submissionId }),
       selectedOption: selectedOptions[0], // Store first selection for MCQ compatibility
       selectedOptions, // Store all selections for MSQ
       isCorrect,
@@ -84,6 +137,12 @@ router.post('/', authorize('student'), async (req, res) => {
     // Check if already responded to prevent duplicates
     const existingResponse = await Response.findOne({ roomId, questionId, studentId })
     if (existingResponse) {
+      if (submissionId && existingResponse.submissionId === submissionId) {
+        const payload = createAcknowledgementPayload(existingResponse.toObject())
+        await storeProcessedSubmission(submissionId, payload)
+        return res.status(200).json(payload)
+      }
+
       return res.status(409).json({ 
         success: false, 
         error: 'Already responded to this question',
@@ -98,15 +157,34 @@ router.post('/', authorize('student'), async (req, res) => {
 
     await response.save()
 
-    res.status(201).json({
-      success: true,
-      response: {
-        ...response.toObject(),
-        isCorrect,
-        points
-      }
+    const payload = createAcknowledgementPayload({
+      ...response.toObject(),
+      isCorrect,
+      points
     })
+    await storeProcessedSubmission(submissionId, payload)
+
+    res.status(201).json(payload)
   } catch (error) {
+    if (error?.code === 11000 && req.body?.submissionId) {
+      try {
+        const Response = (await import('../models/Response.js')).default
+        const submissionId = sanitizeSubmissionId(req.body.submissionId)
+        const existingSubmissionResponse = await Response.findOne({ submissionId })
+        if (existingSubmissionResponse && responseMatchesSubmissionContext(existingSubmissionResponse, {
+          roomId: req.body.roomId,
+          questionId: req.body.questionId,
+          studentId: req.user?._id
+        })) {
+          const payload = createAcknowledgementPayload(existingSubmissionResponse.toObject())
+          await storeProcessedSubmission(submissionId, payload)
+          return res.status(200).json(payload)
+        }
+      } catch (lookupError) {
+        console.error('Error resolving duplicate submission acknowledgement:', lookupError)
+      }
+    }
+
     console.error('Error saving response:', error)
     res.status(500).json({ success: false, error: 'Failed to save response' })
   }

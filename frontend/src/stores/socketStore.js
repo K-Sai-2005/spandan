@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import { io } from 'socket.io-client'
 import { SOCKET_URL } from '../config.js'
 import { getAuthToken } from '../lib/authToken.js'
+import { MANUAL_RECONNECT_EVENT } from '../services/submissionRetryWorker.js'
 
 export const useSocketStore = create((set, get) => ({
   socket: null,
@@ -89,6 +90,20 @@ export const useSocketStore = create((set, get) => ({
     if (socket) {
       socket.disconnect()
       set({ socket: null, isConnected: false, currentRoom: null })
+    }
+  },
+
+  reconnect: (token) => {
+    const { socket } = get()
+
+    if (socket) {
+      socket.connect()
+    } else if (token) {
+      get().connect(token)
+    }
+
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new Event(MANUAL_RECONNECT_EVENT))
     }
   },
 
